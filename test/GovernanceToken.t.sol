@@ -336,6 +336,59 @@ contract GovernanceTokenTest is Test {
         staking.createStakingGroup(members, weights);
     }
 
+    function test_RevertWhen_GroupTooLarge() public {
+        // Create arrays with more than MAX_GROUP_SIZE members
+        address[] memory members = new address[](51);
+        uint256[] memory weights = new uint256[](51);
+
+        for (uint256 i = 0; i < 51; i++) {
+            members[i] = address(uint160(i + 1000)); // Create unique addresses
+            weights[i] = 1; // Equal weights
+        }
+        // Last weight adjusted to sum to 100
+        weights[50] = 50;
+
+        vm.expectRevert("Group size exceeds maximum");
+        staking.createStakingGroup(members, weights);
+    }
+
+    function testRemainderHandling() public {
+        // Create group with weights that will cause rounding
+        address[] memory members = new address[](3);
+        members[0] = user1;
+        members[1] = user2;
+        members[2] = address(0x3);
+
+        uint256[] memory weights = new uint256[](3);
+        weights[0] = 33;
+        weights[1] = 33;
+        weights[2] = 34; // Sum = 100
+
+        uint256 groupId = staking.createStakingGroup(members, weights);
+
+        // Stake an amount that won't divide evenly
+        uint256 stakeAmount = 100 * 10 ** 18; // 100 tokens
+        vm.startPrank(user1);
+        token.approve(address(staking), stakeAmount);
+        staking.stakeToGroup(groupId, stakeAmount);
+        vm.stopPrank();
+
+        uint256 ownerBalanceBefore = token.balanceOf(address(this));
+
+        // Withdraw - this should distribute remainder to owner
+        uint256 withdrawAmount = 10 * 10 ** 18; // Amount that causes rounding (33% of 10 = 3.33)
+        staking.withdrawFromGroup(groupId, withdrawAmount);
+
+        uint256 ownerBalanceAfter = token.balanceOf(address(this));
+
+        // Owner should have received the remainder
+        assertGt(ownerBalanceAfter, ownerBalanceBefore);
+
+        // Check group balance
+        (, uint256 totalAmount,,) = staking.getGroupInfo(groupId);
+        assertEq(totalAmount, stakeAmount - withdrawAmount);
+    }
+
     function testEmptyMembersList() public {
         address[] memory members = new address[](0);
         uint256[] memory weights = new uint256[](0);

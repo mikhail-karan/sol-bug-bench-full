@@ -3,6 +3,7 @@ pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "./StableCoin.sol";
 
@@ -25,6 +26,16 @@ contract PoolShare is ERC20Burnable, Ownable {
     function mint(address to, uint256 amount) external onlyOwner {
         _mint(to, amount);
     }
+
+    /**
+     * @dev Burns pool share tokens from a specific address without requiring allowance
+     * Only callable by the pool contract to allow burning during withdrawal
+     * @param from The address to burn tokens from
+     * @param amount The amount of tokens to burn
+     */
+    function poolOnlyBurn(address from, uint256 amount) external onlyOwner {
+        _burn(from, amount);
+    }
 }
 
 /**
@@ -35,7 +46,7 @@ contract PoolShare is ERC20Burnable, Ownable {
  * The pool implements a time-delay mechanism for withdrawals to ensure stability
  * and prevent flash loan attacks.
  */
-contract LiquidityPool is Ownable {
+contract LiquidityPool is Ownable, ReentrancyGuard {
     PoolShare public immutable shareToken;
 
     // User reward balances tracked separately for efficiency
@@ -45,10 +56,18 @@ contract LiquidityPool is Ownable {
     // Timestamp tracking for withdrawal delay enforcement
     mapping(address => uint256) public lastDepositTime;
 
+    // Internal accounting of total deposits to prevent inflation attacks
+    uint256 public totalPoolDeposits;
+
     // Security delay for withdrawals (24 hours)
     uint256 public constant WITHDRAWAL_DELAY = 1 days;
     // Reward rate as percentage of deposit (10%)
     uint256 public constant REWARD_RATE = 10;
+
+    // EIP-712 type hash for claim authorization
+    bytes32 public constant CLAIM_TYPEHASH = keccak256(
+        "Claim(address user,address recipient,uint256 amount,uint256 nonce,uint256 chainId,address contractAddress)"
+    );
 
     // Event declarations for comprehensive tracking
     event Deposit(address indexed user, uint256 amount, uint256 shares);
@@ -86,7 +105,8 @@ contract LiquidityPool is Ownable {
      * Enforces withdrawal delay for security against flash loan attacks
      * @param shares The number of pool shares to burn for withdrawal
      */
-    function withdraw(uint256 shares) external {
+    function withdraw(uint256 shares) external nonReentrant {
+        require(shares > 0, "Shares must be greater than 0");
         require(shareToken.balanceOf(msg.sender) >= shares, "Insufficient shares");
 
         // Enforce withdrawal delay for security
@@ -95,38 +115,56 @@ contract LiquidityPool is Ownable {
             "Withdrawal delay not met"
         );
 
-        // Calculate ETH amount based on proportional share of pool
-        uint256 amount = shares * address(this).balance / shareToken.totalSupply();
+        // Calculate ETH amount based on proportional share of pool using internal accounting
+        // This prevents donation attacks that inflate the balance without minting shares
+        uint256 amount = shares * totalPoolDeposits / shareToken.totalSupply();
 
-        // Transfer ETH to user
+        // Effects: Burn shares first (checks-effects-interactions pattern)
+        shareToken.poolOnlyBurn(msg.sender, shares);
+
+        // Update internal accounting
+        totalPoolDeposits -= amount;
+
+        // Interactions: Transfer ETH last
         (bool success,) = msg.sender.call{value: amount}("");
         require(success, "Transfer failed");
 
-        // Burn the shares to maintain proper accounting
-        shareToken.transferFrom(msg.sender, address(this), shares);
-        shareToken.burn(shares);
         emit Withdrawal(msg.sender, amount, shares);
     }
 
     /**
      * @dev Claims accumulated rewards using cryptographic signature verification
      * This secure method prevents unauthorized claims while allowing flexibility
-     * @param user The user claiming rewards
+     * @param user The user claiming rewards (must match signature)
+     * @param recipient The recipient address for the reward payout (bound to signature)
      * @param amount The amount of rewards to claim
      * @param nonce The current nonce for replay protection
      * @param signature Cryptographic signature proving authorization
      */
     function claimReward(
         address user,
+        address recipient,
         uint256 amount,
         uint256 nonce,
         bytes memory signature
-    ) external {
+    ) external nonReentrant {
         require(rewards[user] >= amount, "Insufficient rewards");
         require(nonces[user] == nonce, "Invalid nonce");
+        require(recipient != address(0), "Invalid recipient");
 
-        // Verify cryptographic signature to prevent unauthorized claims
-        bytes32 messageHash = keccak256(abi.encode(user, amount, nonce));
+        // Verify cryptographic signature with domain binding to prevent replay attacks
+        // Signature includes: user, recipient, amount, nonce, chainId, and contract address
+        bytes32 messageHash = keccak256(
+            abi.encode(
+                CLAIM_TYPEHASH,
+                user,
+                recipient,
+                amount,
+                nonce,
+                block.chainid,
+                address(this)
+            )
+        );
         address signer = ECDSA.recover(messageHash, signature);
         require(signer == user, "Invalid signature");
 
@@ -134,37 +172,48 @@ contract LiquidityPool is Ownable {
         uint256 fee = amount / 10; // 10% protocol fee
         uint256 userAmount = amount - fee;
 
-        // Transfer protocol fee to treasury
+        // Effects: Update state before any external transfers (checks-effects-interactions)
+        rewards[user] -= amount;
+        nonces[user]++;
+
+        // Emit event before external calls
+        emit RewardClaimed(user, userAmount);
+
+        // Interactions: Transfer protocol fee to treasury (must succeed)
         (bool feeSuccess,) = owner().call{value: fee}("");
         require(feeSuccess, "Fee transfer failed");
 
-        // Transfer remaining amount to user
-        (bool success,) = msg.sender.call{value: userAmount}("");
-        if (success) {
-            rewards[user] -= amount;
-            nonces[user]++;
-
-            // Emit event for tracking reward claims
-            emit RewardClaimed(user, userAmount);
-        }
+        // Interactions: Transfer remaining amount to the specified recipient (must succeed)
+        (bool success,) = recipient.call{value: userAmount}("");
+        require(success, "Reward transfer failed");
     }
 
     /**
      * @dev Internal function to handle deposit logic for any user
      * Calculates shares, mints tokens, and allocates rewards
+     * Uses internal accounting to prevent donation/inflation attacks
      * @param user The address receiving shares and rewards
      * @param amount The ETH amount being deposited
      */
     function _processDeposit(address user, uint256 amount) internal {
-        // Calculate shares based on current pool ratio
+        // Calculate shares based on internal accounting (not address(this).balance)
         uint256 shares;
         if (shareToken.totalSupply() == 0) {
+            // First deposit: reject if there's already ETH in the pool (donation attack protection)
+            require(
+                totalPoolDeposits == 0,
+                "Stray ETH detected: first deposit must be to empty pool"
+            );
             // First deposit gets 1:1 share ratio
             shares = amount;
         } else {
-            // Subsequent deposits get proportional shares
-            shares = (amount * shareToken.totalSupply()) / address(this).balance;
+            // Subsequent deposits get proportional shares based on internal accounting
+            // Using totalPoolDeposits instead of address(this).balance prevents inflation attacks
+            shares = (amount * shareToken.totalSupply()) / totalPoolDeposits;
         }
+
+        // Update internal accounting before external calls
+        totalPoolDeposits += amount;
 
         // Mint shares to the user
         shareToken.mint(user, shares);

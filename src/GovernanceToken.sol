@@ -98,6 +98,9 @@ contract GroupStaking is Ownable {
     // Reference to the governance token
     GovernanceToken public immutable token;
 
+    // Maximum number of members per group to prevent gas limit issues
+    uint256 public constant MAX_GROUP_SIZE = 50;
+
     // Structure to represent a staking group
     struct StakingGroup {
         uint256 id;
@@ -116,6 +119,7 @@ contract GroupStaking is Ownable {
     event GroupCreated(uint256 indexed groupId, address[] members, uint256[] weights);
     event StakeAdded(uint256 indexed groupId, address indexed staker, uint256 amount);
     event RewardsDistributed(uint256 indexed groupId, uint256 amount);
+    event RemainderDistributed(uint256 indexed groupId, uint256 amount, address indexed recipient);
 
     // Errors
     error InvalidTokenAddress();
@@ -123,6 +127,7 @@ contract GroupStaking is Ownable {
     error InvalidMember();
     error BlacklistedMember();
     error DuplicateMember();
+    error GroupTooLarge();
 
     /**
      * @dev Initializes the group staking contract with a governance token
@@ -149,6 +154,7 @@ contract GroupStaking is Ownable {
         require(
             _members.length == _weights.length, "Members and weights length mismatch"
         );
+        require(_members.length <= MAX_GROUP_SIZE, "Group size exceeds maximum");
 
         // Validate weights
         uint256 totalWeight = 0;
@@ -211,6 +217,7 @@ contract GroupStaking is Ownable {
 
     /**
      * @dev Withdraws tokens from a group and distributes them to members
+     * Handles rounding remainder by sending to the group owner
      * @param _groupId The ID of the group to withdraw from
      * @param _amount The amount of tokens to withdraw and distribute
      */
@@ -223,12 +230,21 @@ contract GroupStaking is Ownable {
         // Update group balance
         group.totalAmount -= _amount;
 
-        // Distribute tokens according to weights
+        // Distribute tokens according to weights with remainder handling
+        uint256 totalDistributed = 0;
         for (uint256 i = 0; i < group.members.length; i++) {
             uint256 memberShare = (_amount * group.weights[i]) / 100;
             if (memberShare > 0) {
                 token.transfer(group.members[i], memberShare);
+                totalDistributed += memberShare;
             }
+        }
+
+        // Handle remainder from rounding: send to group owner
+        if (totalDistributed < _amount) {
+            uint256 remainder = _amount - totalDistributed;
+            token.transfer(group.groupOwner, remainder);
+            emit RemainderDistributed(_groupId, remainder, group.groupOwner);
         }
 
         emit RewardsDistributed(_groupId, _amount);

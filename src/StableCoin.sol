@@ -2,6 +2,8 @@
 pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /**
  * @title StableCoin
@@ -12,7 +14,7 @@ import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
  * The design choice provides significant gas savings for frequent transactions
  * within the DeFiHub ecosystem.
  */
-contract StableCoin is ERC20 {
+contract StableCoin is ERC20, Ownable {
     // Events for comprehensive transaction tracking
     event TokensMinted(address indexed to, uint256 amount);
 
@@ -20,7 +22,7 @@ contract StableCoin is ERC20 {
      * @dev Initializes the stablecoin with an initial supply
      * The initial supply is allocated to the deployer for distribution
      */
-    constructor() ERC20("USD Stable", "USDS") {
+    constructor() ERC20("USD Stable", "USDS") Ownable(msg.sender) {
         _mint(msg.sender, 1000000 * 10 ** decimals());
     }
 
@@ -35,11 +37,11 @@ contract StableCoin is ERC20 {
 
     /**
      * @dev Mints new tokens to the specified address
-     * Allows flexible token supply management for protocol operations
+     * Only callable by the contract owner to prevent unauthorized inflation
      * @param to The address that will receive the minted tokens
      * @param amount The amount of tokens to mint
      */
-    function mint(address to, uint256 amount) external {
+    function mint(address to, uint256 amount) external onlyOwner {
         _mint(to, amount);
         emit TokensMinted(to, amount);
     }
@@ -53,7 +55,7 @@ contract StableCoin is ERC20 {
  * for multiple streams per user, custom durations, and proper accounting for
  * additional deposits to existing streams.
  */
-contract TokenStreamer {
+contract TokenStreamer is ReentrancyGuard {
     // Core state variables
     StableCoin public immutable token;
 
@@ -121,6 +123,7 @@ contract TokenStreamer {
      */
     function createStream(address to, uint256 amount, uint256 duration)
         external
+        nonReentrant
         returns (uint256 streamId)
     {
         if (to == address(0)) revert InvalidRecipient();
@@ -129,10 +132,7 @@ contract TokenStreamer {
             revert InvalidStreamDuration();
         }
 
-        require(
-            token.transferFrom(msg.sender, address(this), amount), "Transfer failed"
-        );
-
+        // Effects: Create stream entry before external transfer
         streamId = nextStreamId++;
         streams[streamId] = Stream({
             recipient: to,
@@ -145,6 +145,12 @@ contract TokenStreamer {
         });
 
         userStreams[to].push(streamId);
+
+        // Interactions: Transfer tokens after state update
+        require(
+            token.transferFrom(msg.sender, address(this), amount), "Transfer failed"
+        );
+
         emit StreamCreated(streamId, msg.sender, to, amount, duration);
     }
 
@@ -153,19 +159,21 @@ contract TokenStreamer {
      * @param streamId The ID of the stream to add tokens to
      * @param amount The amount of tokens to add
      */
-    function addToStream(uint256 streamId, uint256 amount) external {
+    function addToStream(uint256 streamId, uint256 amount) external nonReentrant {
         Stream storage stream = streams[streamId];
         if (!stream.exists) revert StreamNotFound();
         if (amount == 0) revert InvalidAmount();
         if (block.timestamp >= stream.endTime) revert StreamEnded();
 
-        require(
-            token.transferFrom(msg.sender, address(this), amount), "Transfer failed"
-        );
-
+        // Effects: Update state before external transfer
         stream.totalDeposited += amount;
         stream.lastUpdateTime = block.timestamp;
         // Note: endTime stays the same, maintaining original timeline
+
+        // Interactions: Transfer tokens after state update
+        require(
+            token.transferFrom(msg.sender, address(this), amount), "Transfer failed"
+        );
 
         emit StreamDeposit(streamId, msg.sender, amount);
     }
@@ -174,7 +182,7 @@ contract TokenStreamer {
      * @dev Withdraws available tokens from a specific stream
      * @param streamId The ID of the stream to withdraw from
      */
-    function withdrawFromStream(uint256 streamId) external {
+    function withdrawFromStream(uint256 streamId) external nonReentrant {
         Stream storage stream = streams[streamId];
         if (!stream.exists) revert StreamNotFound();
         if (msg.sender != stream.recipient) revert NotStreamRecipient();
@@ -182,11 +190,15 @@ contract TokenStreamer {
         uint256 available = getAvailableTokens(streamId);
         if (available == 0) revert InvalidAmount();
 
+        // Effects: Update state before external transfer (checks-effects-interactions)
         stream.totalWithdrawn += available;
         stream.lastUpdateTime = block.timestamp;
 
-        require(token.transfer(msg.sender, available), "Transfer failed");
+        // Emit event before external call
         emit StreamWithdrawal(streamId, msg.sender, available);
+
+        // Interactions: Transfer tokens last
+        require(token.transfer(msg.sender, available), "Transfer failed");
     }
 
     /**
